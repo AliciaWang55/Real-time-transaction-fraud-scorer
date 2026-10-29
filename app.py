@@ -1,111 +1,219 @@
-"""FraudShield: an educational, synthetic transaction-risk demo."""
-# Imports for generating example data, timing the scorer, and serving the web app.
+"""FraudShield: a synthetic-data fraud scoring and evaluation demo."""
+
+# Standard-library helpers create repeatable data and measure scorer time.
 from __future__ import annotations
 
-import math
 import random
 import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
 
+# Flask serves the dashboard and JSON API. scikit-learn trains and evaluates
+# the supervised model using a stratified train/test split.
+import numpy as np
 from flask import Flask, jsonify, render_template_string, request
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import train_test_split
 
-# Create the Flask server and hold a small amount of temporary session data.
-# Data here is in memory and resets whenever the app restarts.
 app = Flask(__name__)
 RECENT = deque(maxlen=100)
-COUNTS = {"approved": 0, "review": 0, "declined": 0, "fraud": 0, "caught": 0, "false_positive": 0}
+FEATURE_NAMES = ["log_amount", "log_distance", "attempts_10m", "new_merchant", "country_mismatch", "e_commerce"]
+DATA_SEED = 20261029
+DATA_SIZE = 20000
+DEFAULT_THRESHOLD = 0.25
 
 
-# Make one fake transaction. A small share gets a hidden fraud label for batch
-# evaluation; the live dashboard never displays that label.
+# Make fake transactions with a hidden label. Fraud examples are uncommon and
+# tend to have different feature patterns, but the distributions overlap.
 def make_transaction(rng: random.Random | None = None) -> dict:
     rng = rng or random
-    fraud = rng.random() < 0.075
+    fraud = rng.random() < 0.015
     if fraud:
-        amount = round(rng.choice([rng.uniform(450, 2400), rng.uniform(2, 20)]), 2)
-        distance = round(rng.uniform(900, 5000))
-        attempts = rng.randint(2, 7)
-        new_merchant = rng.random() < 0.76
-        country_mismatch = rng.random() < 0.55
+        amount = round(rng.choice([rng.lognormvariate(7.1, 0.65), rng.lognormvariate(2.4, 0.5)]), 2)
+        distance = round(rng.expovariate(1 / 1150))
+        attempts = rng.choices([1, 2, 3, 4, 5, 6], [0.10, 0.13, 0.19, 0.22, 0.20, 0.16])[0]
+        new_merchant = rng.random() < 0.62
+        country_mismatch = rng.random() < 0.32
+        channel = rng.choices(["Card present", "E-commerce", "Digital wallet"], [0.12, 0.73, 0.15])[0]
     else:
-        amount = round(min(rng.expovariate(1 / 62), 850) + 4, 2)
-        distance = round(rng.expovariate(1 / 42))
-        attempts = rng.choices([1, 2, 3], [0.86, 0.12, 0.02])[0]
-        new_merchant = rng.random() < 0.13
-        country_mismatch = rng.random() < 0.012
-    return {"id": uuid.uuid4().hex[:10].upper(), "timestamp": datetime.now(timezone.utc).isoformat(),
-            "amount": amount, "currency": "USD", "merchant": rng.choice(["Northstar Market", "Metro Fuel", "CloudNine Travel", "Daily Goods", "Arcade Supply", "Harbor Eats"]),
-            "channel": rng.choice(["Card present", "E-commerce", "Digital wallet"]), "distance_km": distance,
-            "attempts_10m": attempts, "new_merchant": new_merchant, "country_mismatch": country_mismatch,
-            "_label_fraud": fraud}
+        amount = round(min(rng.lognormvariate(3.8, 0.9), 1800), 2)
+        distance = round(rng.expovariate(1 / 48))
+        attempts = rng.choices([1, 2, 3], [0.91, 0.08, 0.01])[0]
+        new_merchant = rng.random() < 0.14
+        country_mismatch = rng.random() < 0.006
+        channel = rng.choices(["Card present", "E-commerce", "Digital wallet"], [0.56, 0.32, 0.12])[0]
+    return {
+        "id": uuid.uuid4().hex[:10].upper(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": amount,
+        "currency": "USD",
+        "merchant": rng.choice(["Northstar Market", "Metro Fuel", "CloudNine Travel", "Daily Goods", "Arcade Supply", "Harbor Eats"]),
+        "channel": channel,
+        "distance_km": distance,
+        "attempts_10m": attempts,
+        "new_merchant": new_merchant,
+        "country_mismatch": country_mismatch,
+        "_label_fraud": fraud,
+    }
 
 
-# Add risk points using readable, hand-written rules and return the reasons.
-# This is not logistic regression, Isolation Forest, or a trained ML model.
-def score_transaction(tx: dict) -> dict:
-    points, reasons = 0, []
-    amount = float(tx.get("amount", 0))
-    distance = float(tx.get("distance_km", 0))
-    attempts = int(tx.get("attempts_10m", 1))
-    if amount >= 1000:
-        points += 35; reasons.append("Unusually high amount (≥ $1,000)")
-    elif amount >= 500:
-        points += 22; reasons.append("High amount (≥ $500)")
-    if distance >= 800:
-        points += 30; reasons.append("Purchase far from recent activity (≥ 800 km)")
-    elif distance >= 300:
-        points += 16; reasons.append("Purchase outside usual area (≥ 300 km)")
-    if attempts >= 5:
-        points += 28; reasons.append("Repeated attempts in the last 10 minutes")
-    elif attempts >= 3:
-        points += 15; reasons.append("Several attempts in the last 10 minutes")
-    if tx.get("new_merchant"):
-        points += 12; reasons.append("First purchase at this merchant")
-    if tx.get("country_mismatch"):
-        points += 25; reasons.append("Merchant country differs from card profile")
-    score = min(99, points)
-    decision = "declined" if score >= 70 else "review" if score >= 35 else "approved"
-    return {"risk_score": score, "decision": decision, "reasons": reasons or ["No notable risk signals"]}
+# Convert transaction fields into numeric features in a fixed order so model
+# training, live scoring, and held-out evaluation all use the same inputs.
+def transaction_features(tx: dict) -> list[float]:
+    return [
+        float(np.log1p(max(0, float(tx.get("amount", 0))))),
+        float(np.log1p(max(0, float(tx.get("distance_km", 0))))),
+        float(tx.get("attempts_10m", 1)),
+        float(bool(tx.get("new_merchant", False))),
+        float(bool(tx.get("country_mismatch", False))),
+        float(tx.get("channel") == "E-commerce"),
+    ]
 
 
-# Score one transaction, measure local scorer time, and save it in recent data.
-def process(tx: dict) -> dict:
+# Create a seeded synthetic dataset, hold out a stratified 20% test set, and
+# fit logistic regression only on the other 80%. Test scores are never used
+# to fit the model. Balanced class weights help with the rare fraud examples.
+def train_model() -> dict:
+    rng = random.Random(DATA_SEED)
+    transactions = [make_transaction(rng) for _ in range(DATA_SIZE)]
+    features = np.asarray([transaction_features(tx) for tx in transactions], dtype=float)
+    labels = np.asarray([int(tx["_label_fraud"]) for tx in transactions], dtype=int)
+    x_train, x_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.20, stratify=labels, random_state=DATA_SEED
+    )
+    classifier = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=DATA_SEED)
+    classifier.fit(x_train, y_train)
+    fraud_scores = classifier.predict_proba(x_test)[:, 1]
+    return {
+        "model": classifier,
+        "x_train": x_train,
+        "y_train": y_train,
+        "y_test": y_test,
+        "fraud_scores": fraud_scores,
+        "fraud_rate": float(labels.mean()),
+    }
+
+
+MODEL_DATA = train_model()
+MODEL = MODEL_DATA["model"]
+
+
+# Calculate threshold-dependent metrics from held-out scores. A transaction
+# counts as flagged when its model score is at or above the chosen threshold.
+def evaluation_metrics(threshold: float) -> dict:
+    threshold = min(0.99, max(0.01, float(threshold)))
+    actual = MODEL_DATA["y_test"]
+    scores = MODEL_DATA["fraud_scores"]
+    predicted = (scores >= threshold).astype(int)
+    matrix = confusion_matrix(actual, predicted, labels=[0, 1])
+    tn, fp, fn, tp = [int(value) for value in matrix.ravel()]
+    return {
+        "threshold": threshold,
+        "precision": float(precision_score(actual, predicted, zero_division=0)),
+        "recall": float(recall_score(actual, predicted, zero_division=0)),
+        "f1": float(f1_score(actual, predicted, zero_division=0)),
+        "roc_auc": float(roc_auc_score(actual, scores)),
+        "confusion_matrix": [[tn, fp], [fn, tp]],
+        "test_size": int(len(actual)),
+        "test_fraud_count": int(actual.sum()),
+        "flagged_count": int(predicted.sum()),
+        "false_positive_rate": float(fp / max(1, fp + tn)),
+    }
+
+
+# Score one live transaction with the trained model and keep the recent result
+# in memory for this server session. The demo uses the current threshold to
+# mark higher-scoring transactions for review or decline.
+def process(tx: dict, threshold: float = DEFAULT_THRESHOLD) -> dict:
     started = time.perf_counter()
-    result = {**tx, **score_transaction(tx)}
-    result["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    risk_score = float(MODEL.predict_proba([transaction_features(tx)])[0][1])
+    if risk_score >= min(0.85, threshold + 0.30):
+        decision = "declined"
+    elif risk_score >= threshold:
+        decision = "review"
+    else:
+        decision = "approved"
+    reasons = []
+    if tx.get("amount", 0) >= 500:
+        reasons.append("High purchase amount")
+    if tx.get("distance_km", 0) >= 300:
+        reasons.append("Purchase far from recent activity")
+    if tx.get("attempts_10m", 1) >= 3:
+        reasons.append("Several attempts in a short period")
+    if tx.get("new_merchant"):
+        reasons.append("First purchase at this merchant")
+    if tx.get("country_mismatch"):
+        reasons.append("Merchant country differs from card profile")
+    result = {
+        **tx,
+        "risk_score": round(risk_score * 100, 1),
+        "decision": decision,
+        "reasons": reasons or ["No notable risk signals"],
+        "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+    }
     result.pop("_label_fraud", None)
     RECENT.appendleft(result)
     return result
 
 
-# The page template contains the dashboard's HTML, CSS, and browser-side
-# JavaScript. The JavaScript requests new transactions from the API below.
-PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FraudShield | Risk Operations</title>
+# Main page markup and styles. The embedded JavaScript below updates the
+# dashboard, requests live transactions, and refreshes test metrics as the
+# threshold slider moves.
+PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FraudShield | Model evaluation</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#f4f6f9;--ink:#162338;--muted:#718096;--line:#e5eaf0;--blue:#185adb;--green:#07845b;--amber:#bc7200;--red:#c23a45}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px 'DM Sans',sans-serif}.top{height:66px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 max(calc((100vw - 1200px)/2),24px)}.brand{display:flex;align-items:center;gap:11px;font-weight:700;font-size:18px;letter-spacing:-.4px}.shield{background:#eaf0ff;color:var(--blue);height:34px;width:34px;border-radius:10px;display:grid;place-items:center;font-size:18px}.live{color:var(--green);font-size:12px;font-weight:600}.live:before{content:'';display:inline-block;background:#17a673;width:7px;height:7px;border-radius:50%;margin-right:7px;box-shadow:0 0 0 3px #d8f4e9}.wrap{max-width:1200px;margin:34px auto;padding:0 24px}.eyebrow{text-transform:uppercase;color:var(--muted);letter-spacing:1.3px;font-size:10px;font-weight:700}.heading{display:flex;justify-content:space-between;align-items:end;margin:0 0 22px}.heading h1{font-size:27px;letter-spacing:-.8px;margin:5px 0}.sub{color:var(--muted);margin:0}.buttons{display:flex;gap:9px}.btn{border:1px solid var(--line);background:white;color:var(--ink);font:600 12px 'DM Sans';padding:10px 14px;border-radius:8px;cursor:pointer}.btn.primary{background:var(--blue);color:white;border-color:var(--blue)}.btn:hover{filter:brightness(.97)}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel{background:#fff;border:1px solid var(--line);border-radius:11px}.card{padding:17px 19px}.cardlabel{font-size:11px;color:var(--muted);font-weight:600}.value{font-size:25px;font-weight:700;margin:9px 0 3px;letter-spacing:-.7px}.hint{font-size:11px;color:var(--muted)}.green{color:var(--green)}.orange{color:var(--amber)}.red{color:var(--red)}.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:15px;margin-top:15px}.panel{padding:19px 20px}.panelhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.panel h2{font-size:14px;margin:0}.small{font-size:11px;color:var(--muted)}table{width:100%;border-collapse:collapse;text-align:left}th{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:700;padding:9px 8px;border-bottom:1px solid var(--line)}td{padding:12px 8px;border-bottom:1px solid #f0f2f5;font-size:11px}tr:last-child td{border:0}.mono{font-family:'DM Mono',monospace;font-size:10px}.pill{padding:4px 8px;border-radius:99px;font-weight:700;font-size:9px;text-transform:uppercase;letter-spacing:.3px}.approved{background:#e5f6ef;color:#06734e}.review{background:#fff2dc;color:#a35d00}.declined{background:#fce9eb;color:#b02f3b}.barrow{margin:18px 0}.barlabel{display:flex;justify-content:space-between;font-size:11px;margin-bottom:7px}.bar{height:7px;background:#edf0f4;border-radius:10px;overflow:hidden}.bar span{height:100%;display:block;border-radius:10px;transition:width .3s}.approvebar{background:#16a675}.reviewbar{background:#e4a32c}.declinebar{background:#d95762}.thresholds{margin-top:24px;padding-top:16px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);line-height:1.8}.thresholds strong{color:var(--ink)}.foot{color:var(--muted);font-size:10px;margin-top:18px;line-height:1.6}.toast{position:fixed;bottom:20px;right:20px;background:#17263c;color:#fff;padding:12px 16px;border-radius:8px;font-size:12px;opacity:0;transition:.2s}.toast.show{opacity:1}@media(max-width:760px){.cards{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.heading{align-items:start;gap:15px;flex-direction:column}.tablewrap{overflow:auto}.top{padding:0 20px}}
-</style></head><body><header class="top"><div class="brand"><div class="shield">⬡</div>FraudShield</div><div class="live">DEMO STREAM ACTIVE</div></header><main class="wrap"><div class="heading"><div><div class="eyebrow">Risk operations · synthetic environment</div><h1>Transaction monitoring</h1><p class="sub">A transparent, rules-based view of incoming card activity.</p></div><div class="buttons"><button class="btn" onclick="runBatch(1000)">Run 1,000 txn batch</button><button class="btn primary" onclick="toggleStream()" id="streamBtn">Pause stream</button></div></div>
-<section class="cards"><div class="card"><div class="cardlabel">Transactions scored</div><div class="value" id="total">0</div><div class="hint">Since this session began</div></div><div class="card"><div class="cardlabel">Approval rate</div><div class="value green" id="approval">—</div><div class="hint">Approved / total</div></div><div class="card"><div class="cardlabel">Flagged for review</div><div class="value orange" id="reviewCount">0</div><div class="hint">Requires analyst attention</div></div><div class="card"><div class="cardlabel">Median scoring latency</div><div class="value" id="latency">—</div><div class="hint">Local API response time</div></div></section>
-<section class="grid"><div class="panel"><div class="panelhead"><h2>Recent transactions</h2><span class="small" id="updated">Waiting for first transaction</span></div><div class="tablewrap"><table><thead><tr><th>Transaction</th><th>Merchant</th><th>Amount</th><th>Risk</th><th>Decision</th><th>Signal</th></tr></thead><tbody id="rows"><tr><td colspan="6" class="small">Starting synthetic stream…</td></tr></tbody></table></div></div><div class="panel"><div class="panelhead"><h2>Decision distribution</h2><span class="small">Session total</span></div><div class="barrow"><div class="barlabel"><span>Approved</span><strong id="aN">0</strong></div><div class="bar"><span class="approvebar" id="aBar" style="width:0"></span></div></div><div class="barrow"><div class="barlabel"><span>Review</span><strong id="rN">0</strong></div><div class="bar"><span class="reviewbar" id="rBar" style="width:0"></span></div></div><div class="barrow"><div class="barlabel"><span>Declined</span><strong id="dN">0</strong></div><div class="bar"><span class="declinebar" id="dBar" style="width:0"></span></div></div><div class="thresholds"><strong>Decision thresholds</strong><br>0–34 · Approve &nbsp; 35–69 · Review &nbsp; 70–99 · Decline<br>Signals: amount, distance, retry frequency, merchant novelty, country mismatch</div></div></section>
-<div class="foot">Educational prototype using generated transactions and transparent heuristic rules. Decisions are illustrative; this is not a production fraud model. Synthetic labels support offline evaluation only.</div></main><div class="toast" id="toast"></div>
-<script>let counts={approved:0,review:0,declined:0},latencies=[],running=true,busy=false;const fmt=n=>Number(n).toLocaleString();function notify(s){let t=document.getElementById('toast');t.textContent=s;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}function paint(data){let d=data.decision;counts[d]++;latencies.push(data.latency_ms);if(latencies.length>101)latencies.shift();let total=counts.approved+counts.review+counts.declined;document.getElementById('total').textContent=fmt(total);document.getElementById('approval').textContent=(counts.approved/total*100).toFixed(1)+'%';document.getElementById('reviewCount').textContent=fmt(counts.review);let sorted=[...latencies].sort((a,b)=>a-b);document.getElementById('latency').textContent=sorted[Math.floor(sorted.length/2)].toFixed(2)+' ms';[['a',counts.approved],['r',counts.review],['d',counts.declined]].forEach(([k,n])=>{document.getElementById(k+'N').textContent=fmt(n);document.getElementById(k+'Bar').style.width=(n/total*100)+'%'});let tr=document.createElement('tr');let reason=data.reasons[0];tr.innerHTML=`<td class="mono">${data.id}</td><td>${data.merchant}</td><td>$${Number(data.amount).toFixed(2)}</td><td><span class="mono ${d==='declined'?'red':d==='review'?'orange':'green'}">${data.risk_score}/99</span></td><td><span class="pill ${d}">${d}</span></td><td title="${data.reasons.join('; ')}">${reason.length>31?reason.slice(0,29)+'…':reason}</td>`;let body=document.getElementById('rows');body.prepend(tr);while(body.children.length>8)body.lastChild.remove();document.getElementById('updated').textContent='Updated just now'}async function tick(){if(!running||busy)return;try{let r=await fetch('/api/transactions/generate',{method:'POST'}),d=await r.json();paint(d)}catch(e){notify('API connection lost')}}async function runBatch(n){if(busy)return;busy=true;notify('Scoring '+fmt(n)+' synthetic transactions…');try{let r=await fetch('/api/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:n})}),d=await r.json();counts=d.decisions;latencies=[d.p50_latency_ms];renderSummary(d);notify('Batch complete · '+d.total+' transactions · '+d.p50_latency_ms.toFixed(2)+' ms p50')}finally{busy=false}}function renderSummary(d){let total=d.total;document.getElementById('total').textContent=fmt(total);document.getElementById('approval').textContent=(d.decisions.approved/total*100).toFixed(1)+'%';document.getElementById('reviewCount').textContent=fmt(d.decisions.review);document.getElementById('latency').textContent=d.p50_latency_ms.toFixed(2)+' ms';[['a',d.decisions.approved],['r',d.decisions.review],['d',d.decisions.declined]].forEach(([k,n])=>{document.getElementById(k+'N').textContent=fmt(n);document.getElementById(k+'Bar').style.width=(n/total*100)+'%'});document.getElementById('rows').innerHTML=d.sample.map(x=>`<tr><td class="mono">${x.id}</td><td>${x.merchant}</td><td>$${x.amount.toFixed(2)}</td><td><span class="mono">${x.risk_score}/99</span></td><td><span class="pill ${x.decision}">${x.decision}</span></td><td title="${x.reasons.join('; ')}">${x.reasons[0]}</td></tr>`).join('');document.getElementById('updated').textContent='Batch evaluation complete'}function toggleStream(){running=!running;document.getElementById('streamBtn').textContent=running?'Pause stream':'Resume stream'}setInterval(tick,850);</script></body></html>'''
+:root{--bg:#f4f6f9;--ink:#162338;--muted:#718096;--line:#e5eaf0;--blue:#185adb;--green:#07845b;--amber:#bc7200;--red:#c23a45}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px 'DM Sans',sans-serif}.top{height:66px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 max(calc((100vw - 1180px)/2),24px)}.brand{display:flex;align-items:center;gap:11px;font-weight:700;font-size:18px}.shield{background:#eaf0ff;color:var(--blue);height:34px;width:34px;border-radius:10px;display:grid;place-items:center;font-size:18px}.live{color:var(--green);font-size:11px;font-weight:700}.live:before{content:'';display:inline-block;background:#17a673;width:7px;height:7px;border-radius:50%;margin-right:7px}.wrap{max-width:1180px;margin:30px auto;padding:0 24px}.eyebrow{text-transform:uppercase;color:var(--muted);letter-spacing:1.2px;font-size:10px;font-weight:700}.heading{display:flex;justify-content:space-between;align-items:end;margin-bottom:18px}.heading h1{font-size:26px;letter-spacing:-.7px;margin:5px 0}.sub{color:var(--muted);margin:0}.panel,.card{background:#fff;border:1px solid var(--line);border-radius:11px}.card{padding:16px 18px}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px}.label{font-size:11px;color:var(--muted);font-weight:600}.value{font-size:23px;font-weight:700;margin:8px 0 3px;letter-spacing:-.5px}.hint{font-size:10px;color:var(--muted)}.green{color:var(--green)}.orange{color:var(--amber)}.red{color:var(--red)}.panel{padding:18px 20px}.row{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}.panelhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}.panel h2{font-size:14px;margin:0}.small{font-size:11px;color:var(--muted)}.split{font-family:'DM Mono',monospace;font-size:10px;background:#f3f6fb;padding:6px 9px;border-radius:6px;color:#4b5c74}.sliderbox{background:#f7f9fc;border:1px solid var(--line);border-radius:9px;padding:14px 15px;margin-bottom:14px}.sliderhead{display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:12px;margin-bottom:9px}.sliderhead strong{font:500 12px 'DM Mono';color:var(--blue)}input[type=range]{width:100%;accent-color:var(--blue)}.rangeends{display:flex;justify-content:space-between;font-size:10px;color:var(--muted)}.tradeoff{font-size:11px;line-height:1.55;color:var(--muted);margin:9px 0 0}.matrix{display:grid;grid-template-columns:24px 1fr 1fr;gap:5px;align-items:stretch;margin:6px auto 0;max-width:390px}.mhead{font-size:9px;text-align:center;color:var(--muted);padding:5px}.axis{writing-mode:vertical-rl;transform:rotate(180deg);font-size:9px;color:var(--muted);display:flex;align-items:center;justify-content:center}.cell{min-height:88px;border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center}.cell strong{font:600 23px 'DM Mono'}.cell span{font-size:10px;margin-top:3px}.tn,.tp{background:#e7f5ee;color:#08724e}.fp{background:#fff0df;color:#a85e00}.fn{background:#fbe8e9;color:#b6323b}.foot{font-size:10px;color:var(--muted);line-height:1.6;margin:14px 2px}.stream{margin-top:14px}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}th{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;padding:9px 8px;border-bottom:1px solid var(--line)}td{padding:11px 8px;border-bottom:1px solid #f0f2f5;font-size:11px}.mono{font-family:'DM Mono',monospace;font-size:10px}.pill{padding:4px 8px;border-radius:99px;font-weight:700;font-size:9px;text-transform:uppercase}.approved{background:#e5f6ef;color:#06734e}.review{background:#fff2dc;color:#a35d00}.declined{background:#fce9eb;color:#b02f3b}.toast{position:fixed;bottom:20px;right:20px;background:#17263c;color:#fff;padding:12px 16px;border-radius:8px;font-size:12px;opacity:0;transition:.2s}.toast.show{opacity:1}@media(max-width:900px){.cards{grid-template-columns:repeat(3,1fr)}.row{grid-template-columns:1fr}}@media(max-width:620px){.cards{grid-template-columns:repeat(2,1fr)}.heading{align-items:start;gap:10px;flex-direction:column}}
+</style></head><body>
+<header class="top"><div class="brand"><div class="shield">⬡</div>FraudShield</div><div class="live">SYNTHETIC MODEL · LOCAL DEMO</div></header>
+<main class="wrap"><div class="heading"><div><div class="eyebrow">Risk operations · model evaluation</div><h1>Threshold lab</h1><p class="sub">Explore fraud alerts on a held-out test set, then watch the live synthetic stream.</p></div><div class="split">Logistic regression · stratified 80 / 20 split</div></div>
+<section class="cards"><div class="card"><div class="label">Precision</div><div class="value green" id="precision">—</div><div class="hint">Flagged transactions that were fraud</div></div><div class="card"><div class="label">Recall</div><div class="value orange" id="recall">—</div><div class="hint">Fraud cases successfully flagged</div></div><div class="card"><div class="label">F1 score</div><div class="value" id="f1">—</div><div class="hint">Balance of precision and recall</div></div><div class="card"><div class="label">ROC-AUC</div><div class="value" id="auc">—</div><div class="hint">Ranking quality across thresholds</div></div><div class="card"><div class="label">False positive rate</div><div class="value red" id="fpr">—</div><div class="hint">Legitimate purchases flagged</div></div></section>
+<section class="row"><div class="panel"><div class="panelhead"><h2>Choose a fraud-alert threshold</h2><span class="split" id="testInfo">Held-out test set</span></div><div class="sliderbox"><div class="sliderhead"><span>Flag as possible fraud at or above</span><strong id="thresholdText">25%</strong></div><input id="threshold" type="range" min="0.01" max="0.95" step="0.01" value="0.25"><div class="rangeends"><span>Lower threshold · more alerts</span><span>Higher threshold · fewer alerts</span></div><p class="tradeoff">Lower the threshold to catch more fraud (higher recall), with more legitimate purchases flagged. Raise it to reduce false alarms, while some fraud may be missed. ROC-AUC stays fixed because it measures ranking across all thresholds.</p></div><div class="panelhead"><h2>Confusion matrix</h2><span class="small" id="flagged">—</span></div><div class="matrix"><div></div><div class="mhead">Predicted legitimate</div><div class="mhead">Predicted fraud</div><div class="axis">Actual</div><div class="cell tn"><strong id="tn">0</strong><span>True negative · legit cleared</span></div><div class="cell fp"><strong id="fp">0</strong><span>False positive · false alarm</span></div><div class="axis">Fraud</div><div class="cell fn"><strong id="fn">0</strong><span>False negative · missed fraud</span></div><div class="cell tp"><strong id="tp">0</strong><span>True positive · fraud caught</span></div></div><p class="foot">Model is trained only on the 80% training split. These metrics are computed from the untouched 20% test split. The synthetic fraud prevalence is <strong id="fraudRate">—</strong>; results are not evidence of real-world payment performance.</p></div>
+<div class="panel"><div class="panelhead"><h2>Model setup</h2><span class="small">Reproducible experiment</span></div><p class="tradeoff"><strong>Data:</strong> generated transactions with known synthetic labels and a deliberately rare fraud class.</p><p class="tradeoff"><strong>Features:</strong> log purchase amount, log distance, recent attempt count, new-merchant flag, country mismatch, and e-commerce flag.</p><p class="tradeoff"><strong>Model:</strong> scikit-learn LogisticRegression with balanced class weights. It learns feature weights from the training split.</p><p class="tradeoff"><strong>Evaluation:</strong> precision, recall, F1, and confusion matrix update from test-set scores as you move the slider. ROC-AUC uses the continuous scores.</p><p class="tradeoff"><strong>Important:</strong> synthetic data is designed for a demo. A model can learn generator patterns that do not match real customer behavior.</p></div></section>
+<section class="panel stream"><div class="panelhead"><h2>Live synthetic transaction stream</h2><span class="small" id="streamStatus">Starting…</span></div><div class="tablewrap"><table><thead><tr><th>Transaction</th><th>Merchant</th><th>Amount</th><th>Model score</th><th>Decision</th><th>Signal</th></tr></thead><tbody id="rows"><tr><td colspan="6" class="small">Generating sample activity…</td></tr></tbody></table></div></section>
+<p class="foot">Educational prototype only. Uses generated transaction data, not Visa data. The live activity stream and held-out evaluation use synthetic examples. Model scores are not calibrated estimates of real fraud probability.</p>
+</main><div class="toast" id="toast"></div>
+<script>
+const fmt=n=>Number(n).toLocaleString(); let streamOn=true;
+function showMetrics(d){document.getElementById('precision').textContent=(100*d.precision).toFixed(1)+'%';document.getElementById('recall').textContent=(100*d.recall).toFixed(1)+'%';document.getElementById('f1').textContent=d.f1.toFixed(3);document.getElementById('auc').textContent=d.roc_auc.toFixed(3);document.getElementById('fpr').textContent=(100*d.false_positive_rate).toFixed(2)+'%';document.getElementById('thresholdText').textContent=Math.round(d.threshold*100)+'%';document.getElementById('tn').textContent=fmt(d.confusion_matrix[0][0]);document.getElementById('fp').textContent=fmt(d.confusion_matrix[0][1]);document.getElementById('fn').textContent=fmt(d.confusion_matrix[1][0]);document.getElementById('tp').textContent=fmt(d.confusion_matrix[1][1]);document.getElementById('flagged').textContent=fmt(d.flagged_count)+' flagged · '+fmt(d.test_size)+' test records';document.getElementById('testInfo').textContent=fmt(d.test_size)+' held-out records';document.getElementById('fraudRate').textContent=(100*d.test_fraud_count/d.test_size).toFixed(2)+'%';}
+let timer;async function updateMetrics(){let t=document.getElementById('threshold').value;try{let res=await fetch('/api/evaluation?threshold='+t);showMetrics(await res.json())}catch(e){}}
+document.getElementById('threshold').addEventListener('input',()=>{document.getElementById('thresholdText').textContent=Math.round(document.getElementById('threshold').value*100)+'%';clearTimeout(timer);timer=setTimeout(updateMetrics,100)});
+function addRow(d){let tr=document.createElement('tr'),why=d.reasons[0];tr.innerHTML=`<td class="mono">${d.id}</td><td>${d.merchant}</td><td>$${Number(d.amount).toFixed(2)}</td><td class="mono">${d.risk_score.toFixed(1)}%</td><td><span class="pill ${d.decision}">${d.decision}</span></td><td title="${d.reasons.join('; ')}">${why.length>34?why.slice(0,32)+'…':why}</td>`;let b=document.getElementById('rows');b.prepend(tr);while(b.children.length>8)b.lastChild.remove();document.getElementById('streamStatus').textContent='New sample just scored'}
+async function tick(){if(!streamOn)return;try{let t=document.getElementById('threshold').value,r=await fetch('/api/transactions/generate?threshold='+t),d=await r.json();addRow(d)}catch(e){document.getElementById('streamStatus').textContent='API connection unavailable'}}
+updateMetrics();tick();setInterval(tick,1200);
+</script></body></html>'''
 
 
-# Show the interactive dashboard at the site's home page.
+# Render the single-page dashboard in the browser.
 @app.get("/")
 def index():
     return render_template_string(PAGE)
 
 
-# Create and score one synthetic transaction for the live dashboard stream.
-@app.post("/api/transactions/generate")
+# Generate and score one fake transaction for the live stream.
+@app.get("/api/transactions/generate")
 def generate():
-    return jsonify(process(make_transaction()))
+    try:
+        threshold = float(request.args.get("threshold", DEFAULT_THRESHOLD))
+    except ValueError:
+        threshold = DEFAULT_THRESHOLD
+    return jsonify(process(make_transaction(), threshold))
 
 
-# Check and score a transaction supplied by a caller as JSON.
+# Return metrics for a selected threshold, using only the held-out test set.
+@app.get("/api/evaluation")
+def evaluation():
+    try:
+        threshold = float(request.args.get("threshold", DEFAULT_THRESHOLD))
+    except ValueError:
+        return jsonify({"error": "threshold must be a number between 0.01 and 0.99"}), 400
+    return jsonify(evaluation_metrics(threshold))
+
+
+# Score a user-supplied transaction JSON object with the trained classifier.
 @app.post("/api/score")
 def score():
     tx = request.get_json(silent=True) or {}
@@ -118,50 +226,18 @@ def score():
     except (TypeError, ValueError):
         return jsonify({"error": "amount and distance_km must be nonnegative; attempts_10m must be a positive integer"}), 400
     tx.setdefault("id", uuid.uuid4().hex[:10].upper())
-    tx.setdefault("merchant", "Example Merchant"); tx.setdefault("channel", "E-commerce"); tx.setdefault("currency", "USD")
+    tx.setdefault("merchant", "Example Merchant")
+    tx.setdefault("channel", "E-commerce")
+    tx.setdefault("currency", "USD")
     return jsonify(process(tx))
 
 
-# Score a repeatable fake batch and compare decisions with its hidden labels.
-# The metrics describe only the generated data and these rules.
-@app.post("/api/evaluate")
-def evaluate():
-    body = request.get_json(silent=True) or {}
-    try:
-        count = max(1, min(10000, int(body.get("count", 1000))))
-    except (ValueError, TypeError):
-        return jsonify({"error": "count must be an integer from 1 to 10000"}), 400
-    rng = random.Random(20261028)
-    results, decisions, latencies = [], {"approved": 0, "review": 0, "declined": 0}, []
-    tp = fp = fn = 0
-    for i in range(count):
-        tx = make_transaction(rng)
-        label = tx.pop("_label_fraud")
-        result = {**tx, **score_transaction(tx)}
-        start = time.perf_counter_ns()
-        score_transaction(tx)
-        latency = (time.perf_counter_ns() - start) / 1_000_000
-        latencies.append(latency)
-        decisions[result["decision"]] += 1
-        predicted = result["decision"] == "declined"
-        tp += predicted and label; fp += predicted and not label; fn += (not predicted) and label
-        if i < 8: results.append({**result, "latency_ms": round(latency, 3)})
-    latencies.sort()
-    p50 = latencies[len(latencies)//2]; p95 = latencies[int((len(latencies)-1)*.95)]
-    return jsonify({"total": count, "decisions": decisions, "fraud_count": tp+fn,
-        "precision": round(tp/(tp+fp), 4) if tp+fp else 0,
-        "recall": round(tp/(tp+fn), 4) if tp+fn else 0,
-        "false_positive_rate": round(fp/max(1, count-(tp+fn)), 4),
-        "p50_latency_ms": round(p50, 4), "p95_latency_ms": round(p95, 4), "sample": results,
-        "evaluation_note": "Fraud = declined. Review outcomes count as not caught for this conservative metric."})
-
-
-# Return a simple status response for checking that the server is running.
+# Let deployment tools or a person quickly check whether the demo is running.
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "mode": "synthetic-demo", "recent_transactions": len(RECENT)})
+    return jsonify({"status": "ok", "mode": "synthetic-logistic-regression", "train_size": len(MODEL_DATA["y_train"]), "test_size": len(MODEL_DATA["y_test"])})
 
 
-# Run the app locally when this file is launched from the command line.
+# Start the local server when app.py is run directly.
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
