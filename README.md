@@ -1,6 +1,8 @@
 # FraudShield
 
-An educational payment-risk demo with a live transaction dashboard, a small JSON scoring API, and a reproducible synthetic batch evaluation. It uses generated data and transparent rules; it is not a production fraud detection system and does not use Visa data or Visa systems.
+FraudShield is an educational web app for exploring synthetic payment-risk scoring. A Flask server provides a browser dashboard and JSON API. A scikit-learn logistic regression model scores generated transactions; a threshold slider shows how changing the alert cutoff affects results on a held-out test set.
+
+This is a local demo using synthetic data, not Visa data or a production fraud system.
 
 ## Run locally
 
@@ -11,33 +13,36 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open [http://127.0.0.1:5000](http://127.0.0.1:5000). The dashboard streams generated transactions. Use **Run 1,000 txn batch** to see reproducible synthetic evaluation metrics; change the count through the API for up to 10,000 records.
+Open [http://127.0.0.1:5000](http://127.0.0.1:5000). The dashboard trains a model on startup, displays evaluation metrics, and streams generated transactions.
+
+## Model and evaluation
+
+- The app generates 20,000 synthetic transactions with known labels and a deliberately rare fraud class.
+- It splits the data into 80% training and 20% test sets using stratification, preserving the fraud share in both splits.
+- Logistic regression is fit only on the training split. The test split is held out for evaluation.
+- The slider changes the probability-score threshold used to flag examples as possible fraud.
+- Precision, recall, F1, false-positive rate, and the confusion matrix update from held-out predictions. ROC-AUC uses continuous model scores and stays constant as the threshold changes.
+- The dataset and metrics are reproducible from a fixed random seed. They only measure how this model performs on this synthetic generator; they do not establish real-world performance.
+
+The model uses log purchase amount, log distance from recent activity, recent attempt count, new-merchant flag, country mismatch, and e-commerce flag. Balanced class weights help the learner account for the rare positive class; the resulting model scores are not presented as calibrated real-world fraud probabilities.
 
 ## API
 
-- `GET /api/health` — readiness and demo mode.
-- `POST /api/transactions/generate` — generate, score, and return one synthetic transaction.
-- `POST /api/score` — score a supplied transaction.
-- `POST /api/evaluate` — evaluate a reproducibly seeded synthetic batch.
+- `GET /api/health` — server status and split sizes.
+- `GET /api/evaluation?threshold=0.25` — held-out metrics at a threshold from 0.01 to 0.99.
+- `GET /api/transactions/generate?threshold=0.25` — create and score one synthetic transaction.
+- `POST /api/score` — score a supplied JSON transaction.
 
-Example score request:
+Example request:
 
 ```bash
 curl -X POST http://127.0.0.1:5000/api/score \
   -H 'Content-Type: application/json' \
-  -d '{"amount":1250,"distance_km":1200,"attempts_10m":4,"new_merchant":true,"country_mismatch":false}'
+  -d '{"amount":1250,"distance_km":1200,"attempts_10m":4,"new_merchant":true,"country_mismatch":false,"channel":"E-commerce"}'
 ```
 
-The scoring rules add points for high amount, unusual distance, repeated attempts, a new merchant, and country mismatch. Scores from 0–34 are approved, 35–69 sent for review, and 70–99 declined. The API response includes the risk score, decision, reasons, and measured local scoring time.
+## Resume bullet template
 
-## Metrics and limitations
+> Built a Flask transaction-risk app with scikit-learn logistic regression; evaluated on a stratified 20% synthetic holdout set and visualized precision, recall, F1, ROC-AUC, and confusion-matrix tradeoffs across decision thresholds.
 
-The batch creates synthetic fraud and non-fraud examples with deliberately different feature distributions. `precision` and `recall` treat **declined** as a positive fraud detection; transactions sent to review are not counted as detected. `false_positive_rate` is the share of synthetic non-fraud transactions declined. Latency is a local Python rule-scoring measurement and does not include network or browser time. Results are seed-reproducible, but describe only this generated dataset and these heuristic rules. They should not be presented as real-world performance or production latency.
-
-This demo intentionally avoids storing real cardholder information. Do not enter real payment or personal data.
-
-## Suggested resume line after running the batch
-
-> Built a Python/Flask transaction-risk scoring API and live dashboard; evaluated transparent fraud rules on 1,000 reproducible synthetic transactions and reported precision, recall, false-positive rate, and local scoring latency.
-
-Replace the batch size and any metric values only with values you observed from the app; describe the records as synthetic and latency as local. This project demonstrates API design, input validation, explainable decision rules, UI integration, and evaluation—not machine-learning model training or payment-network deployment.
+Only add specific metric values after observing the app, and describe the data as synthetic. Do not present these results as Visa or production performance.
