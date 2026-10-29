@@ -1,4 +1,5 @@
 """FraudShield: an educational, synthetic transaction-risk demo."""
+# Imports for generating example data, timing the scorer, and serving the web app.
 from __future__ import annotations
 
 import math
@@ -10,11 +11,15 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
+# Create the Flask server and hold a small amount of temporary session data.
+# Data here is in memory and resets whenever the app restarts.
 app = Flask(__name__)
 RECENT = deque(maxlen=100)
 COUNTS = {"approved": 0, "review": 0, "declined": 0, "fraud": 0, "caught": 0, "false_positive": 0}
 
 
+# Make one fake transaction. A small share gets a hidden fraud label for batch
+# evaluation; the live dashboard never displays that label.
 def make_transaction(rng: random.Random | None = None) -> dict:
     rng = rng or random
     fraud = rng.random() < 0.075
@@ -37,6 +42,8 @@ def make_transaction(rng: random.Random | None = None) -> dict:
             "_label_fraud": fraud}
 
 
+# Add risk points using readable, hand-written rules and return the reasons.
+# This is not logistic regression, Isolation Forest, or a trained ML model.
 def score_transaction(tx: dict) -> dict:
     points, reasons = 0, []
     amount = float(tx.get("amount", 0))
@@ -63,6 +70,7 @@ def score_transaction(tx: dict) -> dict:
     return {"risk_score": score, "decision": decision, "reasons": reasons or ["No notable risk signals"]}
 
 
+# Score one transaction, measure local scorer time, and save it in recent data.
 def process(tx: dict) -> dict:
     started = time.perf_counter()
     result = {**tx, **score_transaction(tx)}
@@ -72,6 +80,8 @@ def process(tx: dict) -> dict:
     return result
 
 
+# The page template contains the dashboard's HTML, CSS, and browser-side
+# JavaScript. The JavaScript requests new transactions from the API below.
 PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FraudShield | Risk Operations</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -83,16 +93,19 @@ PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name
 <script>let counts={approved:0,review:0,declined:0},latencies=[],running=true,busy=false;const fmt=n=>Number(n).toLocaleString();function notify(s){let t=document.getElementById('toast');t.textContent=s;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}function paint(data){let d=data.decision;counts[d]++;latencies.push(data.latency_ms);if(latencies.length>101)latencies.shift();let total=counts.approved+counts.review+counts.declined;document.getElementById('total').textContent=fmt(total);document.getElementById('approval').textContent=(counts.approved/total*100).toFixed(1)+'%';document.getElementById('reviewCount').textContent=fmt(counts.review);let sorted=[...latencies].sort((a,b)=>a-b);document.getElementById('latency').textContent=sorted[Math.floor(sorted.length/2)].toFixed(2)+' ms';[['a',counts.approved],['r',counts.review],['d',counts.declined]].forEach(([k,n])=>{document.getElementById(k+'N').textContent=fmt(n);document.getElementById(k+'Bar').style.width=(n/total*100)+'%'});let tr=document.createElement('tr');let reason=data.reasons[0];tr.innerHTML=`<td class="mono">${data.id}</td><td>${data.merchant}</td><td>$${Number(data.amount).toFixed(2)}</td><td><span class="mono ${d==='declined'?'red':d==='review'?'orange':'green'}">${data.risk_score}/99</span></td><td><span class="pill ${d}">${d}</span></td><td title="${data.reasons.join('; ')}">${reason.length>31?reason.slice(0,29)+'…':reason}</td>`;let body=document.getElementById('rows');body.prepend(tr);while(body.children.length>8)body.lastChild.remove();document.getElementById('updated').textContent='Updated just now'}async function tick(){if(!running||busy)return;try{let r=await fetch('/api/transactions/generate',{method:'POST'}),d=await r.json();paint(d)}catch(e){notify('API connection lost')}}async function runBatch(n){if(busy)return;busy=true;notify('Scoring '+fmt(n)+' synthetic transactions…');try{let r=await fetch('/api/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count:n})}),d=await r.json();counts=d.decisions;latencies=[d.p50_latency_ms];renderSummary(d);notify('Batch complete · '+d.total+' transactions · '+d.p50_latency_ms.toFixed(2)+' ms p50')}finally{busy=false}}function renderSummary(d){let total=d.total;document.getElementById('total').textContent=fmt(total);document.getElementById('approval').textContent=(d.decisions.approved/total*100).toFixed(1)+'%';document.getElementById('reviewCount').textContent=fmt(d.decisions.review);document.getElementById('latency').textContent=d.p50_latency_ms.toFixed(2)+' ms';[['a',d.decisions.approved],['r',d.decisions.review],['d',d.decisions.declined]].forEach(([k,n])=>{document.getElementById(k+'N').textContent=fmt(n);document.getElementById(k+'Bar').style.width=(n/total*100)+'%'});document.getElementById('rows').innerHTML=d.sample.map(x=>`<tr><td class="mono">${x.id}</td><td>${x.merchant}</td><td>$${x.amount.toFixed(2)}</td><td><span class="mono">${x.risk_score}/99</span></td><td><span class="pill ${x.decision}">${x.decision}</span></td><td title="${x.reasons.join('; ')}">${x.reasons[0]}</td></tr>`).join('');document.getElementById('updated').textContent='Batch evaluation complete'}function toggleStream(){running=!running;document.getElementById('streamBtn').textContent=running?'Pause stream':'Resume stream'}setInterval(tick,850);</script></body></html>'''
 
 
+# Show the interactive dashboard at the site's home page.
 @app.get("/")
 def index():
     return render_template_string(PAGE)
 
 
+# Create and score one synthetic transaction for the live dashboard stream.
 @app.post("/api/transactions/generate")
 def generate():
     return jsonify(process(make_transaction()))
 
 
+# Check and score a transaction supplied by a caller as JSON.
 @app.post("/api/score")
 def score():
     tx = request.get_json(silent=True) or {}
@@ -109,6 +122,8 @@ def score():
     return jsonify(process(tx))
 
 
+# Score a repeatable fake batch and compare decisions with its hidden labels.
+# The metrics describe only the generated data and these rules.
 @app.post("/api/evaluate")
 def evaluate():
     body = request.get_json(silent=True) or {}
@@ -141,10 +156,12 @@ def evaluate():
         "evaluation_note": "Fraud = declined. Review outcomes count as not caught for this conservative metric."})
 
 
+# Return a simple status response for checking that the server is running.
 @app.get("/api/health")
 def health():
     return jsonify({"status": "ok", "mode": "synthetic-demo", "recent_transactions": len(RECENT)})
 
 
+# Run the app locally when this file is launched from the command line.
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
