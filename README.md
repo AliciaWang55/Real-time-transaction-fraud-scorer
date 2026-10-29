@@ -41,6 +41,15 @@ curl -X POST http://127.0.0.1:5000/api/score \
   -d '{"amount":1250,"distance_km":1200,"attempts_10m":4,"new_merchant":true,"country_mismatch":false,"channel":"E-commerce"}'
 ```
 
+## Run the API tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite contains 9 pytest cases covering valid scoring responses, a high-risk decision, missing and invalid input, held-out evaluation metrics, and threshold validation.
+
 ## Resume bullet template
 
 > Built a Flask transaction-risk app with scikit-learn logistic regression; evaluated on a stratified 20% synthetic holdout set and visualized precision, recall, F1, ROC-AUC, and confusion-matrix tradeoffs across decision thresholds.
