@@ -87,13 +87,14 @@ def train_model() -> dict:
     )
     classifier = make_pipeline(
         StandardScaler(),
-        LogisticRegression(class_weight="balanced", max_iter=1000, random_state=DATA_SEED),
+        LogisticRegression(class_weight="balanced", max_iter=1000, random_state=DATA_SEED, solver="liblinear"),
     )
     classifier.fit(x_train, y_train)
     fraud_scores = classifier.predict_proba(x_test)[:, 1]
     return {
         "model": classifier,
         "x_train": x_train,
+        "x_test": x_test,
         "y_train": y_train,
         "y_test": y_test,
         "fraud_scores": fraud_scores,
