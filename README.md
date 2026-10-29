@@ -29,8 +29,8 @@ The model uses log purchase amount, log distance from recent activity, recent at
 ## API
 
 - `GET /api/health` — server status and split sizes.
-- `GET /api/evaluation?threshold=0.25` — held-out metrics at a threshold from 0.01 to 0.99.
-- `GET /api/transactions/generate?threshold=0.25` — create and score one synthetic transaction.
+- `GET /api/evaluation?threshold=0.85` — held-out metrics at a threshold from 0.01 to 0.99.
+- `GET /api/transactions/generate?threshold=0.85` — create and score one synthetic transaction.
 - `POST /api/score` — score a supplied JSON transaction.
 
 Example request:
